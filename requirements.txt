@@ -1,0 +1,5 @@
+openai>=1.60
+python-dotenv>=1.0
+semantic-kernel>=1.30
+pytest>=8.0
+PyMySQL>=1.1
