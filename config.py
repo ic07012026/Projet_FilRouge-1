@@ -2,13 +2,14 @@
 # Crée le "Kernel" de Semantic Kernel, connecté à notre déploiement Azure OpenAI.
 # Tous les scripts du projet l'importent : from config import creer_kernel
 import os
+from pathlib import Path
 
 from dotenv import load_dotenv
 from openai import AsyncOpenAI
 from semantic_kernel import Kernel
 from semantic_kernel.connectors.ai.open_ai import OpenAIChatCompletion
 
-load_dotenv()
+load_dotenv(Path(__file__).resolve().parent / ".env")
 
 
 def creer_kernel():
