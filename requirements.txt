@@ -1,6 +1,7 @@
 openai>=1.60,<2
 python-dotenv>=1.0
 semantic-kernel>=1.30
+streamlit>=1.40
 pytest>=8.0
 PyMySQL>=1.1
 pypdf>=5.0

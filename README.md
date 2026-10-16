@@ -63,6 +63,16 @@ sont ignorees. Un PDF illisible ou un repertoire absent provoque une erreur expl
 python agent_catalogue.py
 ```
 
+Pour lancer l'interface web :
+
+```console
+streamlit run app.py
+```
+
+L'interface conserve l'historique pendant la conversation. Le bouton
+« Nouvelle conversation » demarre un nouvel historique ; les outils appeles
+par l'agent sont affiches sous chaque reponse.
+
 Exemple : `Quelles sont les conditions de garantie de NovaTech ?`
 
 L'outil `fiches.rechercher_fiches` compte les mots distincts de plus de trois
