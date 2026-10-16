@@ -1,0 +1,93 @@
+# Prerequis : creer et autoriser le variable group "azure-openai-secrets".
+# Y definir AZURE_OPENAI_API_KEY (secrete), AZURE_OPENAI_ENDPOINT et CHAT_DEPLOYMENT.
+# Projet : agent catalogue Semantic Kernel, PDF dans fiches_fournisseurs/,
+# scripts MySQL dans sql/. Les tests unitaires ne contactent ni Azure ni MySQL.
+# Python 3.13 correspond a la version testee localement.
+trigger:
+  branches:
+    include:
+      - main
+pr: none
+
+variables:
+  - group: azure-openai-secrets
+  - name: PYTHON_VERSION
+    value: '3.13'
+  - name: PIP_CACHE_DIR
+    value: $(Pipeline.Workspace)/.cache/pip
+
+pool:
+  vmImage: ubuntu-latest
+
+stages:
+  - stage: Build
+    jobs:
+      - job: BuildCode
+        steps:
+          - checkout: self
+          - task: UsePythonVersion@0
+            inputs: { versionSpec: '$(PYTHON_VERSION)' }
+          - task: Cache@2
+            inputs:
+              key: '"pip" | "$(Agent.OS)" | "$(PYTHON_VERSION)" | requirements.txt'
+              restoreKeys: '"pip" | "$(Agent.OS)" | "$(PYTHON_VERSION)"'
+              path: $(PIP_CACHE_DIR)
+          - bash: |
+              set -euo pipefail
+              python -m venv .venv
+              .venv/bin/python -m pip install -r requirements.txt
+              .venv/bin/python -m py_compile \
+                agent_catalogue.py catalogue_plugin.py config.py \
+                fiches_plugin.py s_kernel.py test_fiches_plugin.py
+            displayName: Installer et verifier tous les scripts
+          - task: CopyFiles@2
+            inputs:
+              SourceFolder: $(Build.SourcesDirectory)
+              Contents: |
+                **
+                !**/.git/**
+                !**/.venv/**
+                !**/__pycache__/**
+                !**/.pytest_cache/**
+                !**/.env
+                !**/.env.*
+                !**/pipelines-test-results/**
+              TargetFolder: $(Build.ArtifactStagingDirectory)/code
+          - task: PublishPipelineArtifact@1
+            inputs: { targetPath: '$(Build.ArtifactStagingDirectory)/code', artifact: code }
+
+  - stage: Test
+    dependsOn: Build
+    jobs:
+      - job: RunTests
+        steps:
+          - checkout: none
+          - task: DownloadPipelineArtifact@2
+            inputs: { buildType: current, artifactName: code, targetPath: '$(Pipeline.Workspace)/code' }
+          - task: UsePythonVersion@0
+            inputs: { versionSpec: '$(PYTHON_VERSION)' }
+          - task: Cache@2
+            inputs:
+              key: '"pip" | "$(Agent.OS)" | "$(PYTHON_VERSION)" | $(Pipeline.Workspace)/code/requirements.txt'
+              restoreKeys: '"pip" | "$(Agent.OS)" | "$(PYTHON_VERSION)"'
+              path: $(PIP_CACHE_DIR)
+          - bash: |
+              set -euo pipefail
+              python -m venv .venv
+              .venv/bin/python -m pip install -r requirements.txt pytest
+              .venv/bin/python -m pytest test_fiches_plugin.py -q \
+                --junitxml=pipelines-test-results/pytest.xml
+            workingDirectory: $(Pipeline.Workspace)/code
+            displayName: Installer les dependances et executer pytest
+            env:
+              AZURE_OPENAI_API_KEY: $(AZURE_OPENAI_API_KEY)
+              AZURE_OPENAI_ENDPOINT: $(AZURE_OPENAI_ENDPOINT)
+              CHAT_DEPLOYMENT: $(CHAT_DEPLOYMENT)
+          - task: PublishTestResults@2
+            condition: succeededOrFailed()
+            inputs:
+              testResultsFormat: JUnit
+              searchFolder: $(Pipeline.Workspace)/code
+              testResultsFiles: pipelines-test-results/pytest.xml
+              failTaskOnFailedTests: true
+              failTaskOnMissingResultsFile: true
