@@ -1,23 +1,17 @@
-# Prerequis : creer et autoriser le variable group "azure-openai-secrets".
-# Y definir AZURE_OPENAI_API_KEY (secrete), AZURE_OPENAI_ENDPOINT et CHAT_DEPLOYMENT.
-# Projet : agent catalogue Semantic Kernel, PDF dans fiches_fournisseurs/,
-# scripts MySQL dans sql/. Les tests unitaires ne contactent ni Azure ni MySQL.
-# Python 3.13 correspond a la version testee localement.
+# Pipeline existant Build -> Test, adapte a uv et aux tests MySQL sans Azure OpenAI.
 trigger:
   branches:
     include:
-      - main
+      - master
 pr: none
-
-variables:
-  - group: azure-openai-secrets
-  - name: PYTHON_VERSION
-    value: '3.13'
-  - name: PIP_CACHE_DIR
-    value: $(Pipeline.Workspace)/.cache/pip
 
 pool:
   vmImage: ubuntu-latest
+
+variables:
+  PYTHON_VERSION: '3.13'
+  UV_CACHE_DIR: $(Pipeline.Workspace)/.cache/uv
+  MYSQL_CONTAINER: catalogue-test-$(Build.BuildId)-$(System.JobAttempt)
 
 stages:
   - stage: Build
@@ -29,17 +23,21 @@ stages:
             inputs: { versionSpec: '$(PYTHON_VERSION)' }
           - task: Cache@2
             inputs:
-              key: '"pip" | "$(Agent.OS)" | "$(PYTHON_VERSION)" | requirements.txt'
-              restoreKeys: '"pip" | "$(Agent.OS)" | "$(PYTHON_VERSION)"'
-              path: $(PIP_CACHE_DIR)
+              key: '"uv" | "$(Agent.OS)" | "$(PYTHON_VERSION)" | requirements.txt'
+              restoreKeys: '"uv" | "$(Agent.OS)" | "$(PYTHON_VERSION)"'
+              path: $(UV_CACHE_DIR)
           - bash: |
               set -euo pipefail
-              python -m venv .venv
-              .venv/bin/python -m pip install -r requirements.txt
-              .venv/bin/python -m py_compile \
-                agent_catalogue.py catalogue_plugin.py config.py \
-                fiches_plugin.py s_kernel.py test_fiches_plugin.py
-            displayName: Installer et verifier tous les scripts
+              curl -LsSf https://astral.sh/uv/0.11.19/install.sh | sh
+              "$HOME/.local/bin/uv" venv --python "$(PYTHON_VERSION)" .venv
+              "$HOME/.local/bin/uv" pip install --python .venv/bin/python -r requirements.txt
+              "$HOME/.local/bin/uv" run --no-project python -m py_compile \
+                agent_catalogue.py app.py catalogue_plugin.py config.py \
+                fiches_plugin.py s_kernel.py conftest.py \
+                test_fiches_plugin.py test_catalogue_plugin.py test_mysql_integration.py
+            displayName: Installer avec uv et verifier tous les scripts
+            env:
+              UV_CACHE_DIR: $(UV_CACHE_DIR)
           - task: CopyFiles@2
             inputs:
               SourceFolder: $(Build.SourcesDirectory)
@@ -51,6 +49,7 @@ stages:
                 !**/.pytest_cache/**
                 !**/.env
                 !**/.env.*
+                !**/journal.jsonl
                 !**/pipelines-test-results/**
               TargetFolder: $(Build.ArtifactStagingDirectory)/code
           - task: PublishPipelineArtifact@1
@@ -68,21 +67,68 @@ stages:
             inputs: { versionSpec: '$(PYTHON_VERSION)' }
           - task: Cache@2
             inputs:
-              key: '"pip" | "$(Agent.OS)" | "$(PYTHON_VERSION)" | $(Pipeline.Workspace)/code/requirements.txt'
-              restoreKeys: '"pip" | "$(Agent.OS)" | "$(PYTHON_VERSION)"'
-              path: $(PIP_CACHE_DIR)
+              key: '"uv" | "$(Agent.OS)" | "$(PYTHON_VERSION)" | $(Pipeline.Workspace)/code/requirements.txt'
+              restoreKeys: '"uv" | "$(Agent.OS)" | "$(PYTHON_VERSION)"'
+              path: $(UV_CACHE_DIR)
           - bash: |
               set -euo pipefail
-              python -m venv .venv
-              .venv/bin/python -m pip install -r requirements.txt pytest
-              .venv/bin/python -m pytest test_fiches_plugin.py -q \
+              curl -LsSf https://astral.sh/uv/0.11.19/install.sh | sh
+              "$HOME/.local/bin/uv" venv --python "$(PYTHON_VERSION)" .venv
+              "$HOME/.local/bin/uv" pip install --python .venv/bin/python -r requirements.txt
+            workingDirectory: $(Pipeline.Workspace)/code
+            displayName: Installer les dependances avec uv dans .venv
+            env:
+              UV_CACHE_DIR: $(UV_CACHE_DIR)
+          - bash: |
+              set -euo pipefail
+              export MYSQL_ROOT_PASSWORD="$(openssl rand -hex 32)"
+              DB_PASSWORD="$(openssl rand -hex 32)"
+              echo "##vso[task.setvariable variable=DB_PASSWORD;issecret=true]$DB_PASSWORD"
+              docker run --detach --name "$MYSQL_CONTAINER" \
+                --env MYSQL_ROOT_PASSWORD \
+                --publish 127.0.0.1::3306 mysql:8.4
+              pret=false
+              for tentative in $(seq 1 90); do
+                if docker exec "$MYSQL_CONTAINER" sh -c \
+                  'MYSQL_PWD="$MYSQL_ROOT_PASSWORD" mysql --user=root --execute="SELECT 1"' \
+                  >/dev/null 2>&1; then
+                  pret=true
+                  break
+                fi
+                sleep 2
+              done
+              if [ "$pret" != true ]; then
+                docker logs "$MYSQL_CONTAINER"
+                echo "MySQL indisponible apres 180 secondes." >&2
+                exit 1
+              fi
+              {
+                printf "SET @agent_password = '%s';\n" "$DB_PASSWORD"
+                cat sql/00_mysql_base_et_utilisateur.sql \
+                  sql/01_schema.sql sql/02_donnees.sql
+              } | docker exec --interactive "$MYSQL_CONTAINER" sh -c \
+                'MYSQL_PWD="$MYSQL_ROOT_PASSWORD" exec mysql --user=root --default-character-set=utf8mb4'
+              DB_PORT="$(docker inspect --format \
+                '{{(index (index .NetworkSettings.Ports "3306/tcp") 0).HostPort}}' \
+                "$MYSQL_CONTAINER")"
+              echo "##vso[task.setvariable variable=DB_PORT]$DB_PORT"
+            workingDirectory: $(Pipeline.Workspace)/code
+            displayName: Demarrer MySQL et initialiser les scripts SQL du projet
+            env:
+              MYSQL_CONTAINER: $(MYSQL_CONTAINER)
+          - bash: |
+              set -euo pipefail
+              "$HOME/.local/bin/uv" run --no-project pytest -q \
                 --junitxml=pipelines-test-results/pytest.xml
             workingDirectory: $(Pipeline.Workspace)/code
-            displayName: Installer les dependances et executer pytest
+            displayName: Executer les tests unitaires et integration sans Azure OpenAI
             env:
-              AZURE_OPENAI_API_KEY: $(AZURE_OPENAI_API_KEY)
-              AZURE_OPENAI_ENDPOINT: $(AZURE_OPENAI_ENDPOINT)
-              CHAT_DEPLOYMENT: $(CHAT_DEPLOYMENT)
+              RUN_MYSQL_TESTS: '1'
+              DB_HOST: 127.0.0.1
+              DB_PORT: $(DB_PORT)
+              DB_NAME: catalogue
+              DB_USER: agent_ia
+              DB_PASSWORD: $(DB_PASSWORD)
           - task: PublishTestResults@2
             condition: succeededOrFailed()
             inputs:
@@ -91,3 +137,13 @@ stages:
               testResultsFiles: pipelines-test-results/pytest.xml
               failTaskOnFailedTests: true
               failTaskOnMissingResultsFile: true
+              testRunTitle: Catalogue - pytest et MySQL
+          - bash: |
+              set -euo pipefail
+              if docker container inspect "$MYSQL_CONTAINER" >/dev/null 2>&1; then
+                docker rm --force --volumes "$MYSQL_CONTAINER"
+              fi
+            condition: always()
+            displayName: Nettoyer le conteneur MySQL de test
+            env:
+              MYSQL_CONTAINER: $(MYSQL_CONTAINER)
